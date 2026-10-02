@@ -26,6 +26,7 @@
 
 #include "UdfpsHandler.h"
 #include "TouchFeatureCompat.h"
+#include "UdfpsWorker.h"
 
 #define COMMAND_FOD_PRESS_STATUS 1
 #define COMMAND_FOD_PRESS_X 2
@@ -169,6 +170,13 @@ public:
     }
     if (mMonitorThread.joinable())
       mMonitorThread.join();
+    // Finish in-flight commands before the handler or its HAL device is freed.
+    // Delayed retries are owned by the worker and discarded by stopAndJoin().
+    mWorker.runSync([this] {
+      stopOperation();
+      handlePressState(false);
+    });
+    mWorker.stopAndJoin();
     if (mStopPipe[0] >= 0)
       close(mStopPipe[0]);
     if (mStopPipe[1] >= 0)
@@ -202,10 +210,12 @@ public:
     // Stock mfp-daemon does not trigger capture from the framework overlay.
     // Keep these coordinates only as a fallback if the touch input node is
     // absent.
-    mFrameworkX = x;
-    mFrameworkY = y;
-    if (mInputUnavailable && mPhysicalPressed)
-      maybeSendPress();
+    enqueue([this, x, y] {
+      mFrameworkX = x;
+      mFrameworkY = y;
+      if (mInputUnavailable && mPhysicalPressed)
+        maybeSendPress();
+    });
   }
 
   void onFingerUp() { LOG(DEBUG) << __func__; }
@@ -214,17 +224,62 @@ public:
 
   void onEnrollStarted() {
     LOG(INFO) << __func__;
-    startOperation();
+    mWorker.runSync([this] { startOperation(); });
   }
 
   void onAuthenticateStarted() {
     LOG(INFO) << __func__;
-    startOperation();
+    mWorker.runSync([this] { startOperation(); });
   }
 
   void onAcquired(int32_t result, int32_t vendorCode) {
     LOG(DEBUG) << __func__ << " result: " << result
                << " vendorCode: " << vendorCode;
+    enqueue([this, result, vendorCode] { handleAcquired(result, vendorCode); });
+  }
+
+  void onEnrollmentProgress(uint32_t remaining) {
+    enqueue([this, remaining] {
+      if (remaining == 0) {
+        stopOperation();
+      } else if (mOperationActive) {
+        setTouchMode(TOUCH_MODE_FOD_AUTH, 1);
+      }
+    });
+  }
+
+  void onError() { enqueue([this] { stopOperation(); }); }
+
+  bool shouldForwardAcquired(int32_t result, int32_t vendorCode) {
+    // QFP uses vendor acquired 28 to report an unusable ultrasonic sample.
+    return static_cast<AcquiredInfo>(result) == AcquiredInfo::VENDOR &&
+           vendorCode == 28;
+  }
+
+  void cancel() {
+    LOG(INFO) << __func__;
+    // Session::cancel calls the vendor cancel next. Release must finish first.
+    mWorker.runSync([this] { stopOperation(); });
+  }
+
+  void onAuthenticationSucceeded() {
+    enqueue([this] { stopOperation(); });
+  }
+
+  void onAuthenticationFailed() {
+    enqueue([this] {
+      if (mOperationActive)
+        setTouchMode(TOUCH_MODE_FOD_AUTH, 1);
+    });
+  }
+
+private:
+  void enqueue(std::function<void()> task) {
+    if (!mStop)
+      mWorker.post(std::move(task));
+  }
+
+  void handleAcquired(int32_t result, int32_t vendorCode) {
     // Goodix reports 201 before CRC code 41; consuming it would block retry.
     if (!mUseGoodixTouchAuth &&
         static_cast<AcquiredInfo>(result) == AcquiredInfo::VENDOR &&
@@ -245,9 +300,11 @@ public:
       // failing sensor cannot spin on one press.
       if (mOperationActive && mPhysicalPressed && !mContactConsumed &&
           mCaptureSent && mRetryCount < GOODIX_MAX_RETRIES &&
-          !mRetryPending.exchange(true)) {
+          !mRetryPending) {
+        mRetryPending = true;
         const int32_t attempt = ++mRetryCount;
-        const uint32_t generation = mPressGeneration.load();
+        const uint64_t generation = mPressGeneration;
+        const uint64_t operation = mOperationGeneration;
         LOG(INFO) << "Scheduling Goodix FOD retry, attempt " << attempt;
         // Session::notify runs on the HAL callback thread; re-entering the
         // HAL with extCmd here risks deadlock, and the sensor only reports
@@ -255,52 +312,29 @@ public:
         // after the reset so the next capture starts from a clean state.
         // The generation guard drops the retry if the finger was lifted
         // and put down again while the worker slept.
-        std::thread([this, attempt, generation]() {
-          std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        mWorker.postDelayed([this, attempt, generation, operation] {
+          // An old retry must not clear a newer contact's pending flag.
+          if (generation != mPressGeneration ||
+              operation != mOperationGeneration)
+            return;
           mRetryPending = false;
-          if (mStop || !mOperationActive || !mPhysicalPressed ||
-              mContactConsumed || !mCaptureSent ||
-              generation != mPressGeneration.load())
+          if (mStop || !mOperationActive || !mPhysicalPressed || mContactConsumed ||
+              !mCaptureSent)
             return;
           LOG(INFO) << "Retrying Goodix FOD capture, attempt " << attempt;
           sendRelease();
           maybeSendPress();
-        }).detach();
+        }, std::chrono::milliseconds(50));
       }
     }
   }
 
-  void onEnrollmentProgress(uint32_t remaining) {
-    if (remaining == 0) {
-      stopOperation();
-    } else if (mOperationActive) {
-      setTouchMode(TOUCH_MODE_FOD_AUTH, 1);
-    }
-  }
-
-  void onError() { stopOperation(); }
-
-  bool shouldForwardAcquired(int32_t result, int32_t vendorCode) {
-    // QFP uses vendor acquired 28 to report an unusable ultrasonic sample.
-    // Forward it so enrollment can give feedback instead of appearing inert.
-    return static_cast<AcquiredInfo>(result) == AcquiredInfo::VENDOR &&
-           vendorCode == 28;
-  }
-
-  void cancel() {
-    LOG(INFO) << __func__;
-    stopOperation();
-  }
-
-  void onAuthenticationSucceeded() { stopOperation(); }
-
-  void onAuthenticationFailed() {
-    if (mOperationActive)
-      setTouchMode(TOUCH_MODE_FOD_AUTH, 1);
-  }
-
-private:
   void startOperation() {
+    if (mStop || mDevice == nullptr)
+      return;
+    sendRelease();
+    ++mOperationGeneration;
+    mRetryPending = false;
     mTouchX = 0;
     mTouchY = 0;
     mCaptureSent = false;
@@ -314,15 +348,19 @@ private:
   }
 
   void stopOperation() {
-    if (!mOperationActive.exchange(false))
+    ++mOperationGeneration;
+    mRetryPending = false;
+    if (!mOperationActive)
       return;
+    mOperationActive = false;
     sendRelease();
     setTouchMode(TOUCH_MODE_FOD_AUTH, 0);
     setTouchMode(TOUCH_MODE_FOD_ENABLE, 0);
   }
 
   void sendRelease() {
-    if (mCaptureSent.exchange(false)) {
+    if (mCaptureSent) {
+      mCaptureSent = false;
       mDevice->extCmd(mDevice, COMMAND_FOD_PRESS_X, 0);
       mDevice->extCmd(mDevice, COMMAND_FOD_PRESS_Y, 0);
       mDevice->extCmd(mDevice, COMMAND_FOD_PRESS_STATUS, PARAM_FOD_RELEASED);
@@ -353,8 +391,9 @@ private:
   }
 
   void handlePressState(bool pressed) {
-    if (pressed == mPhysicalPressed.exchange(pressed))
+    if (pressed == mPhysicalPressed)
       return;
+    mPhysicalPressed = pressed;
 
     if (pressed) {
       mPressGeneration++;
@@ -393,6 +432,8 @@ private:
   void handleInputEvents(int inputFd) {
     input_event events[16];
     ssize_t bytes;
+    int32_t x = 0;
+    int32_t y = 0;
     while ((bytes = TEMP_FAILURE_RETRY(read(inputFd, events, sizeof(events)))) >
            0) {
       size_t count = static_cast<size_t>(bytes) / sizeof(input_event);
@@ -401,13 +442,19 @@ private:
         if (event.type != EV_ABS || event.value <= 0)
           continue;
         if (event.code == ABS_MT_POSITION_X) {
-          mTouchX = event.value / mResolutionFactor;
+          x = event.value / mResolutionFactor;
         } else if (event.code == ABS_MT_POSITION_Y) {
-          mTouchY = event.value / mResolutionFactor;
+          y = event.value / mResolutionFactor;
         }
       }
     }
-    maybeSendPress();
+    enqueue([this, x, y] {
+      if (x > 0)
+        mTouchX = x;
+      if (y > 0)
+        mTouchY = y;
+      maybeSendPress();
+    });
   }
 
   void monitorTouch() {
@@ -419,17 +466,18 @@ private:
     }
 
     int inputFd = openTouchInput();
-    mInputUnavailable = inputFd < 0;
-    if (mInputUnavailable)
+    const bool inputUnavailable = inputFd < 0;
+    enqueue([this, inputUnavailable] { mInputUnavailable = inputUnavailable; });
+    if (inputUnavailable)
       LOG(WARNING) << "Touch input unavailable; using overlay coordinates";
 
     char initialState = '0';
     TEMP_FAILURE_RETRY(pread(statusFd, &initialState, sizeof(initialState), 0));
 
     pollfd fds[] = {
-        {.fd = mStopPipe[0], .events = POLLIN},
-        {.fd = statusFd, .events = POLLERR | POLLPRI},
-        {.fd = inputFd, .events = POLLIN},
+        {.fd = mStopPipe[0], .events = POLLIN, .revents = 0},
+        {.fd = statusFd, .events = POLLERR | POLLPRI, .revents = 0},
+        {.fd = inputFd, .events = POLLIN, .revents = 0},
     };
 
     while (!mStop) {
@@ -448,7 +496,7 @@ private:
         char state = '0';
         if (TEMP_FAILURE_RETRY(pread(statusFd, &state, sizeof(state), 0)) ==
             1) {
-          handlePressState(state == '1');
+          enqueue([this, pressed = state == '1'] { handlePressState(pressed); });
         }
       }
     }
@@ -465,25 +513,30 @@ private:
   bool mUseQcomIntr2 = false;
   bool mUseGoodixTouchAuth = false;
   std::atomic_bool mStop = false;
-  std::atomic_bool mOperationActive = false;
-  std::atomic_bool mPhysicalPressed = false;
-  std::atomic_bool mCaptureSent = false;
-  std::atomic_bool mContactConsumed = false;
-  std::atomic<int32_t> mRetryCount = 0;
-  std::atomic_bool mRetryPending = false;
-  std::atomic<uint32_t> mPressGeneration = 0;
-  std::atomic_bool mInputUnavailable = true;
-  std::atomic<int32_t> mTouchX = 0;
-  std::atomic<int32_t> mTouchY = 0;
-  std::atomic<int32_t> mFrameworkX = 0;
-  std::atomic<int32_t> mFrameworkY = 0;
+  // Only the worker accesses these fields and sends touch/HAL commands.
+  bool mOperationActive = false;
+  bool mPhysicalPressed = false;
+  bool mCaptureSent = false;
+  bool mContactConsumed = false;
+  int32_t mRetryCount = 0;
+  bool mRetryPending = false;
+  uint64_t mPressGeneration = 0;
+  uint64_t mOperationGeneration = 0;
+  bool mInputUnavailable = true;
+  int32_t mTouchX = 0;
+  int32_t mTouchY = 0;
+  int32_t mFrameworkX = 0;
+  int32_t mFrameworkY = 0;
+  UdfpsWorker mWorker;
 };
 
 static UdfpsHandler *create() { return new SM8750UdfpsHandler(); }
 
 static void destroy(UdfpsHandler *handler) { delete handler; }
 
-extern "C" UdfpsHandlerFactory UDFPS_HANDLER_FACTORY = {
+extern "C" {
+UdfpsHandlerFactory UDFPS_HANDLER_FACTORY = {
     .create = create,
     .destroy = destroy,
 };
+}
